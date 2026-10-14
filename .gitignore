@@ -1,0 +1,19 @@
+.DS_Store
+
+# SAM / CloudFormation
+.aws-sam/
+samconfig.toml
+packaged*.yaml
+cdk.out/
+
+# 環境ごとの設定・認証情報
+.env
+.env.*
+*.pem
+
+# エディタ
+.vscode/
+.idea/
+
+# Claude Code のローカル設定
+.claude/settings.local.json
