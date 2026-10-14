@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  S3 Tables 検証用の基本構成。
-  テーブルバケット、名前空間、Iceberg テーブル（サンプルスキーマ）を作成する。
+  Basic S3 Tables setup for verification.
+  Creates a table bucket, a namespace, and an Iceberg table with a sample schema.
 
 Resources:
   TableBucket:
@@ -35,31 +35,41 @@ Resources:
       IcebergMetadata:
         IcebergSchema:
           SchemaFieldList:
-            - Name: event_id
+            - Id: 1
+              Name: event_id
               Type: string
               Required: true
-            - Name: event_time
+            - Id: 2
+              Name: event_time
               Type: timestamp
               Required: true
-            - Name: message
+            - Id: 3
+              Name: message
               Type: string
+        # event_time を日単位でパーティションする。
+        # SourceId はスキーマのフィールド ID（上の event_time の Id）を指す。
+        IcebergPartitionSpec:
+          Fields:
+            - Name: event_date
+              SourceId: 2
+              Transform: day
       Tags:
         - Key: Purpose
           Value: s3-tables-backup-verification
 
 Outputs:
   TableBucketArn:
-    Description: テーブルバケットの ARN
+    Description: ARN of the table bucket
     Value: !GetAtt TableBucket.TableBucketARN
   NamespaceName:
-    Description: 名前空間名
+    Description: Name of the namespace
     Value: backup_demo
   TableName:
-    Description: テーブル名
+    Description: Name of the table
     Value: sample_events
   TableArn:
-    Description: テーブルの ARN
+    Description: ARN of the table
     Value: !GetAtt Table.TableARN
   WarehouseLocation:
-    Description: テーブルのウェアハウスロケーション
+    Description: Warehouse location of the table
     Value: !GetAtt Table.WarehouseLocation
