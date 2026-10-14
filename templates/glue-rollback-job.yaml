@@ -1,0 +1,111 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Glue ETL job that rolls back an S3 Tables (Iceberg) table to a given snapshot.
+  Run s3tables-basic.yaml first; this stack references its table bucket, namespace and table by fixed names.
+
+Resources:
+  # Glue ジョブのスクリプトを置くバケット。
+  # AWS::Glue::Job は ScriptLocation に S3 の場所しか指定できないため、用意が必要。
+  # スクリプトは templates/glue/rollback_to_snapshot.py を手動でアップロードする。
+  # スタック削除前にバケットを空にしないと、削除に失敗する。
+  ScriptBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: s3-tables-backup-verification
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # CloudWatch Logs への出力と Glue Data Catalog の操作権限を含む。
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3TablesRollbackPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # 巻き戻し対象のテーブルバケットに限定した S3 Tables の権限。
+              - Effect: Allow
+                Action:
+                  - s3tables:GetTableBucket
+                  - s3tables:GetNamespace
+                  - s3tables:ListNamespaces
+                  - s3tables:ListTables
+                  - s3tables:GetTable
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:UpdateTableMetadataLocation
+                  - s3tables:GetTableData
+                  - s3tables:PutTableData
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/s3tables-backup-demo
+                  - !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/s3tables-backup-demo/table/*
+              # Glue Data Catalog 経由で S3 Tables のデータにアクセスするための権限。
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+              # ジョブのスクリプトの読み取り。
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub ${ScriptBucket.Arn}/*
+      Tags:
+        - Key: Purpose
+          Value: s3-tables-backup-verification
+
+  RollbackJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: s3tables-backup-demo-rollback
+      Description: Roll back an S3 Tables table to the snapshot given by --snapshot_id.
+      Role: !GetAtt GlueJobRole.Arn
+      # S3 Tables は Glue 5.0 以降が対象。
+      GlueVersion: '5.0'
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub s3://${ScriptBucket}/scripts/rollback_to_snapshot.py
+      DefaultArguments:
+        # Glue が用意する Iceberg の JAR を使う。
+        '--datalake-formats': iceberg
+        '--job-language': python
+        '--account_id': !Ref AWS::AccountId
+        '--table_bucket_name': s3tables-backup-demo
+        '--namespace': backup_demo
+        '--table_name': sample_events
+        # --snapshot_id は実行時に --arguments で渡す。未指定ならドライランになる。
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      MaxRetries: 0
+      Timeout: 10
+      Tags:
+        Purpose: s3-tables-backup-verification
+
+Outputs:
+  JobName:
+    Description: Name of the Glue job
+    Value: !Ref RollbackJob
+  ScriptBucketName:
+    Description: Bucket to upload rollback_to_snapshot.py to
+    Value: !Ref ScriptBucket
+  ScriptUploadCommand:
+    Description: Command to upload the job script
+    Value: !Sub aws s3 cp templates/glue/rollback_to_snapshot.py s3://${ScriptBucket}/scripts/rollback_to_snapshot.py

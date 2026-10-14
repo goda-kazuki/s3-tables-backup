@@ -2,6 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Basic S3 Tables setup for verification.
   Creates a table bucket, a namespace, and an Iceberg table with a sample schema.
+  Tables in the table bucket are replicated to a replica table bucket in the same Region.
 
 Resources:
   TableBucket:
@@ -10,6 +11,71 @@ Resources:
       TableBucketName: s3tables-backup-demo
       EncryptionConfiguration:
         SSEAlgorithm: AES256
+      # バケットレベルのレプリケーション。バケット内の既存テーブルと今後作るテーブルが対象。
+      # レプリカテーブルは宛先バケットに同名・同名前空間で自動作成される（読み取り専用）。
+      ReplicationConfiguration:
+        Role: !GetAtt ReplicationRole.Arn
+        Rules:
+          - Destinations:
+              - DestinationTableBucketARN: !GetAtt ReplicaTableBucket.TableBucketARN
+      Tags:
+        - Key: Purpose
+          Value: s3-tables-backup-verification
+
+  # レプリケーション先のテーブルバケット。
+  # レプリカテーブルはサービスが作るため CloudFormation の管理外になる。
+  # スタック削除前にレプリカテーブルを削除しないと、このバケットの削除に失敗する。
+  ReplicaTableBucket:
+    Type: AWS::S3Tables::TableBucket
+    Properties:
+      TableBucketName: s3tables-backup-demo-replica
+      EncryptionConfiguration:
+        SSEAlgorithm: AES256
+      Tags:
+        - Key: Purpose
+          Value: s3-tables-backup-verification
+
+  # S3 Tables のレプリケーションがテーブルを複製するために引き受ける IAM ロール。
+  # TableBucket の ReplicationConfiguration から参照されるため、
+  # ロール側ではテーブルバケットを GetAtt せず、名前から ARN を組み立てて循環参照を避ける。
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: replication.s3tables.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3TablesReplicationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3tables:GetTable
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:GetTableMaintenanceConfiguration
+                  - s3tables:GetTableData
+                Resource: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/s3tables-backup-demo/table/*
+              - Effect: Allow
+                Action:
+                  - s3tables:ListTables
+                Resource: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/s3tables-backup-demo
+              - Effect: Allow
+                Action:
+                  - s3tables:CreateTable
+                  - s3tables:CreateNamespace
+                Resource: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/s3tables-backup-demo-replica
+              - Effect: Allow
+                Action:
+                  - s3tables:PutTableData
+                  - s3tables:GetTableData
+                  - s3tables:UpdateTableMetadataLocation
+                  - s3tables:PutTableMaintenanceConfiguration
+                Resource: !Sub arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/s3tables-backup-demo-replica/table/*
       Tags:
         - Key: Purpose
           Value: s3-tables-backup-verification
@@ -57,10 +123,52 @@ Resources:
         - Key: Purpose
           Value: s3-tables-backup-verification
 
+  # Lake Formation の権限。
+  # このアカウントの s3tablescatalog は Lake Formation モード（新規テーブルの
+  # デフォルト権限が空）のため、付与しないと Athena から参照できない。
+  # IAM_ALLOWED_PRINCIPALS は「Lake Formation では絞らず IAM の権限だけで制御する」
+  # ための特別なグループ。この名前空間とテーブルに限り、Glue / Athena / S3 Tables の
+  # IAM 権限を持つ全プリンシパルが参照できる。
+  # スタック削除時は、この権限も取り消される。
+  DatabasePermissions:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: Namespace
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+      Resource:
+        Database:
+          CatalogId: !Sub ${AWS::AccountId}:s3tablescatalog/s3tables-backup-demo
+          Name: backup_demo
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+
+  TablePermissions:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: Table
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+      Resource:
+        Table:
+          CatalogId: !Sub ${AWS::AccountId}:s3tablescatalog/s3tables-backup-demo
+          DatabaseName: backup_demo
+          Name: sample_events
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+
 Outputs:
   TableBucketArn:
     Description: ARN of the table bucket
     Value: !GetAtt TableBucket.TableBucketARN
+  ReplicaTableBucketArn:
+    Description: ARN of the replica table bucket
+    Value: !GetAtt ReplicaTableBucket.TableBucketARN
+  ReplicationRoleArn:
+    Description: ARN of the IAM role used by replication
+    Value: !GetAtt ReplicationRole.Arn
   NamespaceName:
     Description: Name of the namespace
     Value: backup_demo
