@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  S3 Tables 検証用の基本構成。
+  テーブルバケット、名前空間、Iceberg テーブル（サンプルスキーマ）を作成する。
+
+Resources:
+  TableBucket:
+    Type: AWS::S3Tables::TableBucket
+    Properties:
+      TableBucketName: s3tables-backup-demo
+      EncryptionConfiguration:
+        SSEAlgorithm: AES256
+      Tags:
+        - Key: Purpose
+          Value: s3-tables-backup-verification
+
+  Namespace:
+    Type: AWS::S3Tables::Namespace
+    Properties:
+      TableBucketARN: !GetAtt TableBucket.TableBucketARN
+      Namespace: backup_demo
+
+  Table:
+    Type: AWS::S3Tables::Table
+    # Namespace リソースの Ref は「テーブルバケットARN|名前空間名」を返し、
+    # そのままでは Namespace プロパティに渡せない。
+    # 名前は直書きし、作成順だけ DependsOn で保証する。
+    DependsOn: Namespace
+    Properties:
+      TableBucketARN: !GetAtt TableBucket.TableBucketARN
+      Namespace: backup_demo
+      # 大文字を含むと Glue Data Catalog / Athena から見えなくなるため、名前は小文字にする。
+      TableName: sample_events
+      OpenTableFormat: ICEBERG
+      IcebergMetadata:
+        IcebergSchema:
+          SchemaFieldList:
+            - Name: event_id
+              Type: string
+              Required: true
+            - Name: event_time
+              Type: timestamp
+              Required: true
+            - Name: message
+              Type: string
+      Tags:
+        - Key: Purpose
+          Value: s3-tables-backup-verification
+
+Outputs:
+  TableBucketArn:
+    Description: テーブルバケットの ARN
+    Value: !GetAtt TableBucket.TableBucketARN
+  NamespaceName:
+    Description: 名前空間名
+    Value: backup_demo
+  TableName:
+    Description: テーブル名
+    Value: sample_events
+  TableArn:
+    Description: テーブルの ARN
+    Value: !GetAtt Table.TableARN
+  WarehouseLocation:
+    Description: テーブルのウェアハウスロケーション
+    Value: !GetAtt Table.WarehouseLocation
