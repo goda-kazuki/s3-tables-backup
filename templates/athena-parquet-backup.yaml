@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Backup destination for S3 Tables daily exports.
+  Creates an S3 bucket for Parquet exports and Athena query results, an Athena workgroup
+  that writes query results to that bucket, and an external table over the exported Parquet files.
+  This account grants IAM_ALLOWED_PRINCIPALS on new Glue databases automatically,
+  so the template does not manage Lake Formation permissions.
+  Run s3tables-basic.yaml first; the export queries read its table by fixed names.
+
+Resources:
+  # 日ごとの差分を Parquet で退避するバケット。Athena のクエリ結果も同じバケットに置く。
+  #   backup/sample_events/dt=YYYY-MM-DD/  退避データ（UNLOAD の出力先）
+  #   athena-results/                      クエリ結果
+  # スタック削除前にバケットを空にしないと、削除に失敗する。
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # S3 のバケット名は全世界で一意になる必要があるため、アカウント ID とリージョンを含める。
+      # 名前を固定すると、プロパティの変更でバケットの置き換えが必要になった場合、更新が失敗する。
+      BucketName: !Sub s3tables-backup-demo-export-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: s3-tables-backup-verification
+
+  # S3 Tables への書き込み（INSERT / DELETE）は、ワークグループの暗号化が SSE-KMS / CSE-KMS だと
+  # 実行できない。そのため暗号化は SSE_S3 にする。
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: s3tables-backup-demo
+      Description: Workgroup for exporting S3 Tables data to Parquet and restoring it.
+      # ワークグループにクエリ履歴などが残っていても、スタック削除で一緒に消す。
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        # 結果の出力先をワークグループの設定に固定し、クライアント側の設定で上書きさせない。
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${BackupBucket}/athena-results/
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+      Tags:
+        - Key: Purpose
+          Value: s3-tables-backup-verification
+
+  # 退避した Parquet を読むための Glue データベースとテーブル。
+  # S3 Tables の名前空間（backup_demo）とは別に、通常の Glue Data Catalog に作る。
+  ArchiveDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: backup_demo_archive
+        Description: External tables over the Parquet exports of the S3 Tables table.
+
+  # 退避データを読む外部テーブル。
+  # パーティションは dt=YYYY-MM-DD のフォルダに対応する。
+  # フォルダを追加したあとは、MSCK REPAIR TABLE でパーティションを読み込む。
+  # event_time は、退避時に文字列（マイクロ秒まで残る）で出しているため string で定義する。
+  # 復元の INSERT で CAST(event_time AS timestamp(6)) に戻す。
+  ArchiveTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref ArchiveDatabase
+      TableInput:
+        Name: sample_events_archive
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: 'TRUE'
+          classification: parquet
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        StorageDescriptor:
+          Columns:
+            - Name: event_id
+              Type: string
+            - Name: event_time
+              Type: string
+            - Name: message
+              Type: string
+          Location: !Sub s3://${BackupBucket}/backup/sample_events/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+
+  # Lake Formation の権限は、このテンプレートでは付与しない。
+  # このアカウントの Glue Data Catalog は、新しく作ったデータベースとテーブルに
+  # IAM_ALLOWED_PRINCIPALS（IAM の権限だけで制御するグループ）への権限を自動で付ける。
+  # s3tables-basic.yaml と同じ権限を作ろうとすると、AlreadyExists で失敗した。
+  # この挙動は、Lake Formation の「新しいデータベースの既定の権限」の設定による。
+  # 設定が異なるアカウントでは、Athena から参照できない場合に、権限を別途付与する。
+
+Outputs:
+  BackupBucketName:
+    Description: Bucket for Parquet exports and Athena query results
+    Value: !Ref BackupBucket
+  ExportLocation:
+    Description: S3 location the UNLOAD query writes to
+    Value: !Sub s3://${BackupBucket}/backup/sample_events/
+  WorkGroupName:
+    Description: Athena workgroup to run the export and restore queries in
+    Value: !Ref AthenaWorkGroup
+  ArchiveDatabaseName:
+    Description: Glue database that holds the external table over the exports
+    Value: !Ref ArchiveDatabase
+  ArchiveTableName:
+    Description: External table over the Parquet exports
+    Value: !Ref ArchiveTable

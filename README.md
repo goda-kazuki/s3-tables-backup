@@ -163,3 +163,78 @@ aws glue get-job-run --region ap-northeast-1 \
 aws s3 rm "s3://${BUCKET}" --recursive
 aws cloudformation delete-stack --stack-name s3tables-backup-demo-glue --region ap-northeast-1
 ```
+
+## Parquet への退避（Athena）
+
+スナップショットの保持期間（120 時間）より前に戻せるよう、日ごとの差分を Athena の `UNLOAD` で S3 に Parquet として退避する。
+設計は `docs/superpowers/specs/2026-10-14-parquet-backup-restore-design.md` にある。
+
+`templates/athena-parquet-backup.yaml` は、退避の土台として次のリソースを作成する。
+先に `s3tables-basic.yaml` をデプロイしておく。
+
+- 退避データとクエリ結果を置く S3 バケット `s3tables-backup-demo-export-<アカウントID>-<リージョン>`。暗号化は SSE-S3、パブリックアクセスはブロックする。名前にアカウント ID とリージョンを含めるのは、S3 のバケット名が全世界で一意である必要があるため。
+- Athena ワークグループ `s3tables-backup-demo`。結果の出力先を上のバケットの `athena-results/` に固定する。暗号化は SSE-S3 にする。
+
+- Glue データベース `backup_demo_archive` と、退避データを読む外部テーブル `sample_events_archive`。`dt` を文字列のパーティション列にする。`event_time` は、退避が文字列なので `string` で定義する。
+
+ワークグループの暗号化を SSE-KMS または CSE-KMS にすると、Athena から S3 Tables への書き込み（`INSERT` や `DELETE`）ができなくなる。
+このため SSE-S3 にしている。
+
+Lake Formation の権限は、このテンプレートでは付与しない。
+このアカウントでは、新しい Glue データベースに `IAM_ALLOWED_PRINCIPALS` の権限が自動で付く。
+同じ権限をテンプレートで作ると、`AlreadyExists` で失敗した。
+アカウントの設定が異なり、Athena から参照できない場合は、権限を別途付与する。
+
+### デプロイ
+
+IAM ロールを作らないため、`--capabilities` は不要。
+
+```bash
+aws cloudformation deploy \
+  --template-file templates/athena-parquet-backup.yaml \
+  --stack-name s3tables-backup-demo-athena \
+  --region ap-northeast-1
+```
+
+出力値（バケット名、`UNLOAD` の出力先、ワークグループ名）は、次のコマンドで確認できる。
+
+```bash
+aws cloudformation describe-stacks --stack-name s3tables-backup-demo-athena \
+  --region ap-northeast-1 \
+  --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output text
+```
+
+### 退避先のレイアウト
+
+```
+s3://s3tables-backup-demo-export-123456789012-ap-northeast-1/backup/sample_events/dt=2026-10-01/*.parquet
+s3://s3tables-backup-demo-export-123456789012-ap-northeast-1/athena-results/
+```
+
+### 退避と復元
+
+SQL は `templates/athena/` にある。Athena のワークグループ `s3tables-backup-demo` で、1 文ずつ実行する。
+
+- `export_day.sql` 指定した日の差分を、Parquet で退避する。実行前に、`event_time` の範囲と `<ACCOUNT_ID>` を書き換える。
+- `restore_to_date.sql` テーブルを、指定した日の状態に戻す。全行を `DELETE` し、`dt` が指定日以下の退避データを `INSERT` する。
+
+注意点は次のとおり。
+
+- `event_time` は文字列で退避する。Athena の `UNLOAD` は、Parquet にミリ秒精度のタイムスタンプしか書けず、Iceberg のマイクロ秒精度のままでは `NOT_SUPPORTED` エラーになる。`timestamp(3)` に変換するとミリ秒未満が切り捨てられるため、文字列にして、復元時に `timestamp(6)` に戻す。
+- 同じ日を再実行すると、ファイルが増えて行が重複する。再退避の前に、`dt=YYYY-MM-DD/` のフォルダを削除する。
+- `MSCK REPAIR TABLE` は、データソースを `AwsDataCatalog` にして実行する。S3 Tables のカタログのままだと、「Unsupported DDL query for S3 table buckets」で拒否される。
+- 復元の `DELETE` と `INSERT` は別の文。間で失敗するとテーブルが空になる。`INSERT` を再実行すれば戻る。
+- 退避は `event_time` ベースの差分。退避済みの日の行を後から更新しても、その日を再退避しないと反映されない。
+
+### 削除
+
+バケットは、空にしてからスタックを削除する。
+
+```bash
+BUCKET=$(aws cloudformation describe-stacks --stack-name s3tables-backup-demo-athena \
+  --region ap-northeast-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='BackupBucketName'].OutputValue" --output text)
+
+aws s3 rm "s3://${BUCKET}" --recursive
+aws cloudformation delete-stack --stack-name s3tables-backup-demo-athena --region ap-northeast-1
+```

@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parquet 退避と特定の日への復元 設計</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1f2328; --muted: #656d76; --line: #d8dee4;
+    --card: #ffffff; --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --ng: #cf222e;
+    --code-bg: #f3f4f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --muted: #8b949e; --line: #30363d;
+      --card: #161b22; --accent: #58a6ff; --ok: #3fb950; --warn: #d29922; --ng: #f85149;
+      --code-bg: #1c2128;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    line-height: 1.75;
+  }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 1.7rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; font-size: .9rem; }
+  h2 {
+    font-size: 1.25rem; margin: 40px 0 12px; padding-bottom: 6px;
+    border-bottom: 2px solid var(--line);
+  }
+  h3 { font-size: 1rem; margin: 20px 0 6px; }
+  p { margin: 8px 0; }
+  ul, ol { margin: 8px 0; padding-left: 1.4em; }
+  li { margin: 3px 0; }
+  code {
+    background: var(--code-bg); padding: 1px 6px; border-radius: 4px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .88em;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 14px; overflow-x: auto; margin: 10px 0;
+  }
+  pre code { background: none; padding: 0; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; background: var(--card); }
+  th, td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); font-size: .9rem; }
+  a { color: var(--accent); word-break: break-all; }
+
+  .summary {
+    background: var(--card); border: 1px solid var(--line); border-left: 5px solid var(--accent);
+    border-radius: 8px; padding: 14px 18px; margin: 20px 0;
+  }
+  .summary h2 { border: none; margin: 0 0 6px; padding: 0; font-size: 1.05rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin: 12px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px;
+  }
+  .card h3 { margin-top: 0; }
+  .tag {
+    display: inline-block; font-size: .75rem; font-weight: 600; padding: 1px 8px;
+    border-radius: 999px; border: 1px solid currentColor; margin-right: 6px;
+  }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .ng { color: var(--ng); }
+
+  .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin: 12px 0; }
+  .step {
+    flex: 1 1 140px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font-size: .88rem; position: relative;
+  }
+  .step b { display: block; color: var(--accent); font-size: .78rem; margin-bottom: 2px; }
+  .step:not(:last-child)::after {
+    content: "\25B6"; position: absolute; right: -12px; top: 50%; transform: translateY(-50%);
+    color: var(--muted); font-size: .7rem; z-index: 1;
+  }
+  details { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 6px 14px; margin: 10px 0; }
+  summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+  .note { color: var(--muted); font-size: .88rem; }
+  .changed {
+    background: var(--card); border: 1px solid var(--line); border-left: 5px solid var(--warn);
+    border-radius: 8px; padding: 10px 16px; margin: 12px 0; font-size: .92rem;
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Parquet 退避と特定の日への復元 設計</h1>
+<p class="sub">2026-10-14 / S3 Tables バックアップ記事の検証用 / 状態: レビュー待ち（未コミット）</p>
+
+<div class="changed">
+  <b>更新内容</b>: 復元の意味を「特定の日のデータを入れ直す」から「テーブル全体を特定の日の状態に戻す」に改めた。
+  退避は、日ごとの差分にする。
+</div>
+
+<div class="summary">
+  <h2>要点だけ読む場合</h2>
+  <ul>
+    <li><b>課題</b>: スナップショットは 120 時間しか持たず、それより前には戻せない。</li>
+    <li><b>退避</b>: 日ごとの差分を、Athena の <code>UNLOAD</code> で S3 に Parquet として出す。</li>
+    <li><b>復元</b>: 日付 D を指定する。全行を <code>DELETE</code> し、D までの退避データを <code>INSERT</code> する。テーブルは D 時点の状態になる。</li>
+    <li><b>範囲</b>: 手動実行のみ。日次の自動実行は作らない。</li>
+    <li><b>追加物</b>: テンプレート1つと、SQL 2ファイル。既存のテンプレートは変更しない。</li>
+    <li><b>未確認</b>: S3 Tables を元にした <code>UNLOAD</code> が動くか。再実行で行が重複するか。条件なしの <code>DELETE</code> が使えるか。実機で確かめる。</li>
+  </ul>
+</div>
+
+<h2>1. 目的とスコープ</h2>
+<p>
+  スナップショットの保持期間より前の状態を、S3 Tables のテーブルに戻せるようにします。
+  保持期間を延ばすとメタデータが肥大化するため、延ばしません。
+  成果物はブログ記事と <code>templates/</code> のテンプレートです。運用向けの自動化は作りません。
+</p>
+<h3>用語</h3>
+<ul>
+  <li><b>退避</b>: その日の <code>event_time</code> の行だけを、日ごとの差分として Parquet に出力すること。</li>
+  <li><b>特定の日への復元</b>: 日付 D を指定して、テーブルの全行を D までの退避データで置き換えること。D より後の日付のデータは入らない。</li>
+</ul>
+<div class="grid">
+  <div class="card">
+    <h3><span class="tag ok">含む</span></h3>
+    <ul>
+      <li>退避先の S3 バケット、Athena ワークグループ、外部テーブル</li>
+      <li>日ごとの差分を退避する <code>UNLOAD</code> の SQL</li>
+      <li>特定の日へ復元する <code>DELETE</code> と <code>INSERT</code> の SQL</li>
+      <li>検証手順と、記事への追記</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><span class="tag ng">含まない</span></h3>
+    <ul>
+      <li>日次の自動実行。記事では方針の説明にとどめる</li>
+      <li>毎日のテーブル全体のコピー</li>
+      <li>既存の 2 つのテンプレートの変更</li>
+      <li>退避データのライフサイクル管理</li>
+    </ul>
+  </div>
+</div>
+
+<h2>2. 前提と仮定</h2>
+<table>
+  <tr><th style="width:9em">種類</th><th>内容</th></tr>
+  <tr>
+    <td>あなたの指示</td>
+    <td>退避は Athena、形式は Parquet、粒度は日ごとの差分。復元は「特定の日に復元」で、テーブル全体を D 時点の状態に戻す。復元まで検証する。実行は手動。<code>event_time</code> のミリ秒未満の切り捨ては、バックアップとして不十分なので認めない。マイクロ秒まで残す。</td>
+  </tr>
+  <tr>
+    <td>私の仮定</td>
+    <td>差分の単位は <code>event_time</code> の日単位。復元は「全行を削除し、<code>dt</code> が D 以下の退避データを入れ直す」形。復元も Athena の SQL だけで行う。</td>
+  </tr>
+</table>
+
+<h2>3. 公式ドキュメントで確認した内容</h2>
+<ul>
+  <li>Athena は S3 Tables に対して <code>INSERT</code>、<code>UPDATE</code>、<code>DELETE</code>、<code>MERGE</code> を実行できる。</li>
+  <li>ワークグループの暗号化が SSE-KMS または CSE-KMS だと、S3 Tables への書き込みはできない。Requester Pays が有効でも DML はできない。このワークグループは SSE-S3 にする。</li>
+  <li><code>UNLOAD</code> の出力先は、パーティション指定がなければ空でなければならない。データがあると書き込まずに終わる。</li>
+  <li>パーティション指定がある場合は、同じ出力先と同じパーティションへの再実行が許される。</li>
+  <li><code>partitioned_by</code> の列は、<code>SELECT</code> の最後に置く。Parquet の既定の圧縮は gzip。</li>
+</ul>
+<p class="note">
+  参照元:
+  <a href="https://docs.aws.amazon.com/athena/latest/ug/unload.html">UNLOAD</a> /
+  <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-athena.html">S3 Tables と Athena</a> /
+  <a href="https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-updating-iceberg-table-data.html">Iceberg のデータ更新</a>
+</p>
+
+<h2>4. 実機で確かめること</h2>
+<p>ドキュメントだけでは確定できません。検証で確認し、結果を記事に書きます。</p>
+<table>
+  <tr><th style="width:2.5em">#</th><th>確認事項</th><th>ダメだった場合</th></tr>
+  <tr>
+    <td>1</td>
+    <td>S3 Tables のテーブルを <code>SELECT</code> 元にした <code>UNLOAD</code> が動くか。ドキュメントに記載がない。</td>
+    <td>設計を見直す。代替は <code>CREATE TABLE AS SELECT</code> で外部テーブルに書く方法。</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td>同じ日を再実行したとき、上書きされるのか、ファイルが増えて行が重複するのか。</td>
+    <td>再退避の前に、対象日のフォルダを削除する手順を加える。</td>
+  </tr>
+  <tr>
+    <td>3</td>
+    <td>条件なしの <code>DELETE</code> で、S3 Tables のテーブルの全行を消せるか。</td>
+    <td><code>event_time</code> が全期間に入る範囲条件で <code>DELETE</code> する。</td>
+  </tr>
+  <tr>
+    <td>4</td>
+    <td>全行の <code>DELETE</code> のあと <code>INSERT</code> した結果が、元と一致するか。タイムスタンプの精度も見る。</td>
+    <td>型の指定を直す。</td>
+  </tr>
+</table>
+
+<h2>4.5 検証で分かったこと</h2>
+<p>退避のステップで確認した内容です。</p>
+<ol>
+  <li><span class="tag ok">確認済み</span><code>UNLOAD</code> は S3 Tables のテーブルを元にして動く。ただし、タイムスタンプ列には制約がある。</li>
+  <li><span class="tag ng">制約</span>Parquet 出力は、ミリ秒精度のタイムスタンプしか書けない。Iceberg の <code>timestamp</code> はマイクロ秒精度のため、そのまま出すと <code>NOT_SUPPORTED</code> エラーになる。</li>
+  <li><span class="tag ng">不採用</span><code>timestamp(3)</code> への変換は切り捨てになる。<code>.123456</code> と <code>.123567</code> は、どちらも <code>.123</code> になる。バックアップとして不十分なので採用しない。</li>
+  <li><span class="tag ok">採用</span><code>event_time</code> は文字列で退避する。<code>CAST(event_time AS varchar)</code> で <code>2026-10-01 00:00:00.123456</code> の形になる。復元で <code>CAST(... AS timestamp(6))</code> を使うと、マイクロ秒まで戻る。Athena で往復を確認した。</li>
+  <li><span class="tag warn">注意</span>同じ日を再実行すると、ファイルが増えて行が重複する。上書きにはならない。再退避の前に、その日のフォルダを削除する。</li>
+  <li><span class="tag warn">注意</span>出力ファイルに拡張子は付かない。中身は Parquet である。</li>
+</ol>
+<p>復元のステップで、次のことを確認しました。</p>
+<ol start="7">
+  <li><span class="tag ok">確認済み</span>条件なしの <code>DELETE</code> で、S3 Tables のテーブルの全行を削除できる。</li>
+  <li><span class="tag ok">確認済み</span>2 つのカタログをまたいだ <code>INSERT ... SELECT</code> が動く。S3 Tables のカタログへの <code>INSERT</code> で、通常のカタログの外部テーブルを読める。テーブル名は、カタログ名から書く。</li>
+  <li><span class="tag ok">確認済み</span>文字列の <code>event_time</code> が、<code>timestamp(6)</code> に正しく戻る。復元後のテーブルは、10/2 の状態の 2 行になった。</li>
+  <li><span class="tag warn">注意</span><code>MSCK REPAIR TABLE</code> は、データソースを <code>AwsDataCatalog</code> にして実行する。S3 Tables のカタログのままだと、「Unsupported DDL query for S3 table buckets」で拒否される。</li>
+  <li><span class="tag ok">確認済み</span><code>DELETE</code> と <code>INSERT</code> は、それぞれスナップショットとして残る。復元の操作も、スナップショットで巻き戻せる。</li>
+</ol>
+
+<h2>5. 構成</h2>
+<p>新しいテンプレート <code>templates/athena-parquet-backup.yaml</code> を作ります。</p>
+<table>
+  <tr><th style="width:14em">リソース</th><th>役割</th></tr>
+  <tr><td>S3 バケット</td><td>退避データとクエリ結果の置き場。暗号化は SSE-S3、パブリックアクセスはブロックする。</td></tr>
+  <tr><td>Athena ワークグループ</td><td>結果の出力先を、上のバケットの別プレフィックスに固定する。暗号化は SSE-S3。</td></tr>
+  <tr><td>Glue データベースと外部テーブル</td><td>退避した Parquet を読む。<code>dt</code> を文字列のパーティション列にする。<code>event_time</code> は、退避が文字列なので <code>string</code> で定義する。</td></tr>
+  <tr><td>Lake Formation の権限</td><td>テンプレートでは付与しない。このアカウントでは、新しい Glue データベースに <code>IAM_ALLOWED_PRINCIPALS</code> の権限が自動で付く。同じ権限を作ろうとして <code>AlreadyExists</code> で失敗したため、外した。</td></tr>
+</table>
+
+<h3>退避先のレイアウト</h3>
+<pre><code>s3://&lt;バケット&gt;/backup/sample_events/dt=2026-10-01/*.parquet
+s3://&lt;バケット&gt;/backup/sample_events/dt=2026-10-02/*.parquet
+s3://&lt;バケット&gt;/athena-results/</code></pre>
+
+<h3>SQL ファイル</h3>
+<p>記事と実ファイルを一致させるため、<code>templates/athena/</code> に置きます。</p>
+<ul>
+  <li><code>export_day.sql</code>: 日ごとの差分の退避。<code>partitioned_by = ARRAY['dt']</code> を指定する。</li>
+  <li><code>restore_to_date.sql</code>: 特定の日への復元。全行を <code>DELETE</code> し、外部テーブルの <code>dt</code> が D 以下の行を <code>INSERT</code> する。<code>INSERT</code> では、文字列の <code>event_time</code> を <code>timestamp(6)</code> に戻す。</li>
+</ul>
+<p>パーティションは <code>MSCK REPAIR TABLE</code> で読み込みます。パーティション射影は使いません。仕組みを増やさず、記事を読みやすくするためです。</p>
+
+<h2>6. データの流れ</h2>
+<h3>退避（日ごとに実行）</h3>
+<div class="flow">
+  <div class="step"><b>1</b>再退避の場合は、対象日のフォルダ <code>dt=YYYY-MM-DD/</code> を先に削除する</div>
+  <div class="step"><b>2</b>対象日を <code>event_time</code> の範囲で絞った <code>SELECT</code> を作る。<code>event_time</code> は文字列にする</div>
+  <div class="step"><b>3</b><code>dt</code> 列を最後に付けて <code>UNLOAD</code> する</div>
+  <div class="step"><b>4</b><code>dt=YYYY-MM-DD/</code> に Parquet が出力される</div>
+</div>
+<h3>復元（日付 D を指定）</h3>
+<div class="flow">
+  <div class="step"><b>1</b><code>MSCK REPAIR TABLE</code> でパーティションを読み込む</div>
+  <div class="step"><b>2</b>退避済みの <code>dt</code> の一覧を確認する。D までの日が揃っているか見る</div>
+  <div class="step"><b>3</b><code>dt</code> が D 以下の行数を確認する</div>
+  <div class="step"><b>4</b>S3 Tables のテーブルの全行を <code>DELETE</code></div>
+  <div class="step"><b>5</b>外部テーブルの <code>dt</code> が D 以下の行を <code>INSERT</code></div>
+  <div class="step"><b>6</b>元のテーブルの行を確認する</div>
+</div>
+
+<details>
+  <summary>SQL のイメージ（実装時に確定）</summary>
+  <pre><code>-- 退避（10/1 の例）
+UNLOAD (
+  SELECT event_id,
+         CAST(event_time AS varchar) AS event_time,
+         message,
+         CAST(date(event_time) AS varchar) AS dt
+  FROM "s3tablescatalog/s3tables-backup-demo"."backup_demo"."sample_events"
+  WHERE event_time &gt;= TIMESTAMP '2026-10-01 00:00:00'
+    AND event_time &lt;  TIMESTAMP '2026-10-02 00:00:00'
+)
+TO 's3://&lt;バケット&gt;/backup/sample_events/'
+WITH (format = 'PARQUET', compression = 'SNAPPY',
+      partitioned_by = ARRAY['dt']);
+
+-- 復元（10/2 の状態に戻す例）
+-- 事前確認
+MSCK REPAIR TABLE "backup_demo_archive"."sample_events_archive";
+SELECT dt, count(*) FROM "backup_demo_archive"."sample_events_archive"
+WHERE dt &lt;= '2026-10-02' GROUP BY dt ORDER BY dt;
+
+-- 全行を削除
+DELETE FROM "s3tablescatalog/s3tables-backup-demo"."backup_demo"."sample_events";
+
+-- D 以下の退避データを入れ直す
+INSERT INTO "s3tablescatalog/s3tables-backup-demo"."backup_demo"."sample_events"
+SELECT event_id, CAST(event_time AS timestamp(6)), message
+FROM "backup_demo_archive"."sample_events_archive"
+WHERE dt &lt;= '2026-10-02';</code></pre>
+</details>
+
+<h2>7. エラーと制約</h2>
+<p>記事にも書く内容です。</p>
+<ul>
+  <li><span class="tag warn">注意</span>復元の <code>DELETE</code> と <code>INSERT</code> は別の文。間で失敗すると、テーブルが空になる。<code>INSERT</code> を再実行すれば戻る。実行前に、手順 2 と 3 で退避データが揃っているか確認する。</li>
+  <li><span class="tag warn">注意</span>退避の漏れは、復元しても気づけない。D までの日のどれかが退避されていないと、その日の行が静かに欠ける。手順 2 の一覧で確認する。</li>
+  <li><span class="tag ng">制約</span>退避は <code>event_time</code> ベースの差分。退避済みの日の行を後から更新または削除しても、退避データには反映されない。その日を再退避しないと、D 時点の状態を正確に再現できない。</li>
+  <li><span class="tag warn">注意</span>退避は、その日が終わってから行う。日の途中に退避すると、残りの行が漏れる。</li>
+  <li><span class="tag warn">注意</span>同じ日を再実行すると、ファイルが増えて行が重複する。再退避の前に、対象日のフォルダを削除する。</li>
+  <li><span class="tag warn">注意</span><code>UNLOAD</code> は、失敗時に出力済みデータを削除しない。再実行の前に、対象日のフォルダを確認する。</li>
+  <li><span class="tag warn">注意</span>退避データの <code>event_time</code> は文字列である。退避データを直接調べるときは、<code>CAST</code> が必要になる。</li>
+  <li><span class="tag ok">問題なし</span><code>UNLOAD</code> のパーティション数の上限は 100。1 回の退避は 1 日分なので超えない。</li>
+</ul>
+
+<h2>8. 検証手順</h2>
+<p>現在のテーブルは、10/1 から 10/3 の 3 行です。</p>
+<ol>
+  <li>テンプレートをデプロイする。</li>
+  <li>10/1 から 10/3 を 1 日ずつ退避し、S3 のフォルダと Parquet を確認する。</li>
+  <li>外部テーブルで、退避データを <code>SELECT</code> して確認する。</li>
+  <li>誤ったデータとして、<code>evt-0004</code> を 10/3 に追加する。テーブルは 4 行になる。</li>
+  <li>10/2 を指定して、<code>restore_to_date.sql</code> を実行する。</li>
+  <li>テーブルが <code>evt-0001</code> と <code>evt-0002</code> の 2 行になり、<code>evt-0003</code> と <code>evt-0004</code> が消えていることを確認する。</li>
+</ol>
+<p>
+  5 日待たずに検証するため、誤ったデータは <code>INSERT</code> で再現します。
+  退避データがスナップショットに依存しないことは、設計上の性質として記事に書きます。
+  5 日経過後の実証は、今回は行いません。
+</p>
+
+<h2>9. 運用ルールとの関係</h2>
+<ul>
+  <li><code>sam validate --lint</code> でテンプレートを検証する。</li>
+  <li>AWS へのデプロイは、あなたの明示的な指示があるときだけ行う。デプロイ時はスタック名とリージョンを確認し、削除手順も合わせて示す。</li>
+  <li>バケットは、空にしてからスタックを削除する。手順を README に書く。</li>
+  <li>記事の末尾に、確認元の URL を参考リンクとして残す。</li>
+  <li>アカウント ID とバケット名は、記事ではダミー値に置き換える。</li>
+  <li>この設計書とこの HTML は、まだコミットしていない。コミットは指示があったときに行う。</li>
+</ul>
+
+</main>
+</body>
+</html>
