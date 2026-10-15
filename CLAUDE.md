@@ -6,11 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Amazon S3 Tables のバックアップ方法についてブログ記事を書くためのリポジトリ。
 記事本文（Markdown）と、記事内で紹介する検証用の CloudFormation / AWS SAM テンプレートを管理する。
-記事は1本だけ書く予定。アプリケーションコードやテストスイートは存在しない。成果物は記事とテンプレート。
+記事は2本書く予定。アプリケーションコードやテストスイートは存在しない。成果物は記事とテンプレート。
 
 ## 構成
 
-- `article.md` 記事本文。記事は1本だけなので、新しい記事ファイルは作らずこのファイルを編集する。
+- `article-backup-methods.md` 1本目の記事。バックアップ方法（レプリケーション、スナップショット、Parquet 退避）。
+- `article-table-recovery.md` 2本目の記事。テーブルを削除したときの、レプリカからの復帰。
+  記事はこの2本だけなので、新しい記事ファイルは作らず、内容に応じてどちらかを編集する。
 - `templates/` 記事で使う CloudFormation / SAM テンプレート。記事から参照するものはここに置く。
 - `images/` 記事で使うスクリーンショットや図。
 

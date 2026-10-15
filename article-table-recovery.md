@@ -1,0 +1,246 @@
+# Amazon S3 Tables のテーブルを削除してみた。レプリカからの復帰と、同名で作り直したときのレプリケーション失敗
+
+とりあえず要点メモ
+
+1本目の記事「Amazon S3 Tables のバックアップ方法を試してみた。レプリケーション、スナップショット、Parquet 退避」では、データを書き間違えた場合の戻し方を確認しました。
+この記事では、テーブル自体を誤って削除した場合を確認します。テーブルを削除すると、スナップショットも一緒に失われます。
+
+前提は、1本目の記事と同じ構成です。テーブルバケットは、同じリージョンのレプリカ用テーブルバケットに、バケット単位でレプリケーションしています。
+
+## 準備
+
+以降のコマンドで使う変数を定義します。
+新しいシェルを開くと変数は消えます。空のままだと、`Invalid endpoint: https://s3tables..amazonaws.com` というエラーになります。
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGION=ap-northeast-1
+SRC_ARN="arn:aws:s3tables:${REGION}:${ACCOUNT_ID}:bucket/s3tables-backup-demo"
+REPLICA_ARN="arn:aws:s3tables:${REGION}:${ACCOUNT_ID}:bucket/s3tables-backup-demo-replica"
+```
+
+## 検証用のテーブルを作成する
+
+1本目で使った `sample_events` は残しておきたいので、検証用のテーブル `delete_test` を作ります。
+
+```bash
+aws s3tables create-table --region "$REGION" \
+  --table-bucket-arn "$SRC_ARN" --namespace backup_demo --name delete_test \
+  --format ICEBERG \
+  --metadata '{"iceberg":{"schema":{"fields":[{"name":"id","type":"string","required":true},{"name":"note","type":"string"}]}}}'
+```
+
+Athena から書き込めるように、Lake Formation の権限を付与します。
+IAM の権限だけで制御するグループに、全権限を付与します。
+
+```bash
+aws lakeformation grant-permissions --region "$REGION" \
+  --principal DataLakePrincipalIdentifier=IAM_ALLOWED_PRINCIPALS \
+  --permissions ALL \
+  --resource "{\"Table\":{\"CatalogId\":\"${ACCOUNT_ID}:s3tablescatalog/s3tables-backup-demo\",\"DatabaseName\":\"backup_demo\",\"Name\":\"delete_test\"}}"
+```
+
+1件投入します。ワークグループは s3tables-backup-demo、データソースは s3tablescatalog/s3tables-backup-demo を選びます。
+
+```sql
+INSERT INTO "s3tablescatalog/s3tables-backup-demo"."backup_demo"."delete_test"
+  (id, note)
+VALUES ('1', '削除テスト用');
+```
+
+レプリカができるまで、数分かかります。
+それまでは、レプリカを読むと「ICEBERG_INVALID_METADATA: Table is missing [metadata_location] property」というエラーになります。
+次のコマンドで、状態が completed になるまで待ちます。
+
+```bash
+TABLE_ARN=$(aws s3tables get-table --region "$REGION" \
+  --table-bucket-arn "$SRC_ARN" --namespace backup_demo --name delete_test \
+  --query tableARN --output text)
+
+aws s3tables get-table-replication-status --region "$REGION" --table-arn "$TABLE_ARN"
+```
+
+レプリカを読むには、レプリカ側のテーブルにも、Lake Formation の権限が必要です。
+データソースを s3tablescatalog/s3tables-backup-demo-replica にして、同じ1件があることを確認します。
+
+```bash
+aws lakeformation grant-permissions --region "$REGION" \
+  --principal DataLakePrincipalIdentifier=IAM_ALLOWED_PRINCIPALS \
+  --permissions ALL \
+  --resource "{\"Table\":{\"CatalogId\":\"${ACCOUNT_ID}:s3tablescatalog/s3tables-backup-demo-replica\",\"DatabaseName\":\"backup_demo\",\"Name\":\"delete_test\"}}"
+```
+
+```sql
+SELECT * FROM "s3tablescatalog/s3tables-backup-demo-replica"."backup_demo"."delete_test";
+```
+
+| # | id | note |
+|---|----|------|
+| 1 | 1 | 削除テスト用 |
+
+## 元のテーブルを削除しても、レプリカは残る
+
+```bash
+aws s3tables delete-table --region "$REGION" \
+  --table-bucket-arn "$SRC_ARN" --namespace backup_demo --name delete_test
+```
+
+元のテーブルは消えますが、レプリカはテーブルもデータも残っていました。
+レプリカは、誤ったテーブル削除に対するバックアップとして使えます。
+
+削除したテーブルを戻すコマンドは、探しましたが見つかりませんでした。
+
+```bash
+aws s3tables help | grep -i -E "restore|undelete|recover"
+```
+
+## レプリカからテーブルを作り直す
+
+レプリカは読み取り専用で、元のテーブルに昇格させることはできません。
+元のテーブルを同じスキーマで作り直し、レプリカからデータを入れ直します。
+先ほどの `create-table` と同じコマンドで、同じスキーマのテーブルを作り直します。
+
+```sql
+INSERT INTO "s3tablescatalog/s3tables-backup-demo"."backup_demo"."delete_test"
+  (id, note)
+SELECT id, note
+FROM "s3tablescatalog/s3tables-backup-demo-replica"."backup_demo"."delete_test";
+```
+
+データは、ちゃんと戻りました。
+
+## 同じ名前で作り直すと、レプリケーションが失敗する
+
+作り直したテーブルに追加で書き込んでも、レプリカに反映されませんでした。
+
+```sql
+INSERT INTO "s3tablescatalog/s3tables-backup-demo"."backup_demo"."delete_test"
+  (id, note)
+VALUES ('2', '追加書き込みでレプリケートされるのか');
+```
+
+レプリケーションの状態を見ると、failed になっています。
+
+```text
+"replicationStatus": "failed",
+"failureMessage": "A table with an identical name already exists at the destination."
+```
+
+作り直したテーブルは別のテーブルとして扱われ、レプリカ側に残っている同名のテーブルとぶつかります。
+復元は成功しても、作り直したテーブルには、バックアップがない状態になります。
+
+## 直し方
+
+レプリカの古いテーブルの名前を、rename-table で変えました。
+
+```bash
+VERSION_TOKEN=$(aws s3tables get-table-metadata-location --region "$REGION" \
+  --table-bucket-arn "$REPLICA_ARN" --namespace backup_demo --name delete_test \
+  --query versionToken --output text)
+
+aws s3tables rename-table --region "$REGION" \
+  --table-bucket-arn "$REPLICA_ARN" --namespace backup_demo --name delete_test \
+  --new-name delete_test_old --version-token "$VERSION_TOKEN"
+```
+
+名前は変わりましたが、10分待っても failed のままで、再試行されませんでした。
+
+次に、バケットのレプリケーション設定を、同じ内容で入れ直しました。
+
+```bash
+VT=$(aws s3tables get-table-bucket-replication --region "$REGION" \
+  --table-bucket-arn "$SRC_ARN" --query versionToken --output text)
+
+aws s3tables get-table-bucket-replication --region "$REGION" \
+  --table-bucket-arn "$SRC_ARN" --query configuration --output json > replication.json
+
+aws s3tables put-table-bucket-replication --region "$REGION" \
+  --table-bucket-arn "$SRC_ARN" --version-token "$VT" --configuration file://replication.json
+```
+
+数分後に、レプリカ側に delete_test が新しく作られ、状態が completed になりました。
+追加した3件が、すべてレプリカに反映されています。
+
+| テーブル | 中身 |
+|---|---|
+| 元の delete_test | 3 件 |
+| 新しいレプリカの delete_test | 3 件 |
+| 名前を変えた delete_test_old | 1 件（削除前の状態） |
+
+## 復元の順序
+
+今回は、作り直しを先にして、衝突しました。
+テーブルの削除から復元するときは、次の順序が安全です。
+
+1. レプリカの古いテーブルの名前を変える。
+2. 元のテーブルを同じスキーマで作り直す。
+3. 名前を変えたレプリカから、データを入れ直す。
+4. レプリケーションの状態が completed になることを確認する。
+
+この順序で、もう一度試しました。レプリカの古いテーブルは、delete_test_bk に名前を変えています。
+
+1. 元の delete_test を削除する。
+2. レプリカの delete_test を、delete_test_bk に名前を変える。
+3. 元の delete_test を、同じスキーマで作り直す。
+4. delete_test_bk から、データを入れ直す。
+
+```sql
+INSERT INTO "s3tablescatalog/s3tables-backup-demo"."backup_demo"."delete_test"
+  (id, note)
+SELECT id, note
+FROM "s3tablescatalog/s3tables-backup-demo-replica"."backup_demo"."delete_test_bk";
+```
+
+結果は、次のとおりです。
+
+- レプリケーションの状態は、failed にならず、pending から completed になりました。
+- 作り直した直後に、レプリカ側にも delete_test が新しく作られました。completed になるまで、約7分かかりました。
+- 入れ直した3件が、元とレプリカの両方にあります。
+- 復元の後に追加で書き込んだ1件も、数分でレプリカに反映されました。
+
+同じ名前で作り直したときの失敗は、この順序で避けられます。
+
+作り直しや名前の変更のたびに、テーブルが別の名前として扱われるため、Athena から読むための Lake Formation の権限も、付け直しが必要です。
+
+## まとめ
+
+- テーブルを誤って削除しても、レプリカは残ります。レプリカからデータを入れ直して、元のテーブルを作り直せます。
+- 削除したテーブルを戻す専用のコマンドは、見つかりませんでした。
+- 同じ名前で作り直すと、レプリケーションが失敗します。レプリカの古いテーブルの名前を先に変えると、避けられます。
+- 復元の後は、レプリケーションの状態が completed になることを確認します。
+
+## 注意点
+
+- レプリカは読み取り専用です。元のテーブルに昇格させることはできないため、作り直して、データを入れ直します。
+- 作り直したテーブルは別のテーブルです。ARN とテーブル ID が変わり、スナップショットの履歴は新しく始まります。メンテナンス設定やタグなども、設定し直します。
+- 作り直しや名前の変更のたびに、Lake Formation の権限を付け直します。
+- 復元の直後から、レプリケーションが completed になるまで、約7分かかりました。この間は、作り直したテーブルのバックアップが追いついていません。
+- 名前を変えるだけでは再試行されず、10分待っても failed のままでした。名前を先に変えれば、設定の入れ直しは不要でした。それ以上待った場合に自動で直るかは、確認していません。
+- 検証は、同じアカウントの同じリージョンで行いました。別のリージョンや別のアカウントへのレプリケーションは、試していません。
+
+## 後片付け
+
+検証で作った delete_test、delete_test_old、delete_test_bk は、元のバケットとレプリカのバケットの両方から削除します。
+付与した Lake Formation の権限は、テーブルを削除する前に取り消します。残っていると、名前空間とバケットの削除が失敗します。
+テーブルが残ったままだと、スタックの削除も失敗します。
+
+```bash
+aws s3tables delete-table --region "$REGION" \
+  --table-bucket-arn "$SRC_ARN" --namespace backup_demo --name delete_test
+
+aws s3tables delete-table --region "$REGION" \
+  --table-bucket-arn "$REPLICA_ARN" --namespace backup_demo --name delete_test
+
+aws s3tables delete-table --region "$REGION" \
+  --table-bucket-arn "$REPLICA_ARN" --namespace backup_demo --name delete_test_bk
+
+aws s3tables delete-table --region "$REGION" \
+  --table-bucket-arn "$REPLICA_ARN" --namespace backup_demo --name delete_test_old
+```
+
+## 参考リンク
+
+- [How S3 Tables replication works](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-replication-how-replication-works.html)
+- [Managing S3 Tables replication（レプリケーションの状態の確認）](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-replication-managing.html)
+- [rename-table（AWS CLI）](https://docs.aws.amazon.com/cli/latest/reference/s3tables/rename-table.html)
+- [put-table-bucket-replication（AWS CLI）](https://docs.aws.amazon.com/cli/latest/reference/s3tables/put-table-bucket-replication.html)

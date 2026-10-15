@@ -2,7 +2,8 @@
 
 Amazon S3 Tables のバックアップについてのブログ記事と、検証用テンプレートを管理するリポジトリ。
 
-- `article.md` 記事（Markdown）
+- `article-backup-methods.md` 1本目の記事（Markdown）。バックアップ方法（レプリケーション、スナップショット、Parquet 退避）
+- `article-table-recovery.md` 2本目の記事（Markdown）。テーブルを削除したときの、レプリカからの復帰
 - `templates/` CloudFormation / AWS SAM テンプレート
 - `images/` 記事で使う画像
 
