@@ -10,7 +10,7 @@
 --
 -- event_time は Iceberg ではマイクロ秒精度（timestamp(6)）だが、Athena の Parquet 出力は
 -- ミリ秒精度（timestamp(3)）しか書けない。そのまま出すと NOT_SUPPORTED エラーになる。
--- timestamp(3) に変換するとミリ秒未満が切り捨てられ、バックアップとして不十分になる。
+-- timestamp(3) に変換するとミリ秒未満が失われ、バックアップとして不十分になる。
 -- そのため、マイクロ秒まで残る文字列（例: 2026-10-01 00:00:00.123456）にして出す。
 -- 復元のときに CAST(event_time AS timestamp(6)) で元の型に戻す。
 --
